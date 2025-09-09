@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template to deploy a VPC with public and private subnets, an ALB, an EC2 instance with Apache2, and a NAT Gateway.'
+Description: 'Deploy a VPC with public and private subnets, an ALB, two EC2 instances running Docker Swarm, and a NAT Gateway.'
 
 Resources:
   VPC:
@@ -80,6 +80,7 @@ Resources:
 
   NATGateway:
     Type: AWS::EC2::NatGateway
+    DependsOn: ElasticIP
     Properties:
       AllocationId: !GetAtt ElasticIP.AllocationId
       SubnetId: !Ref PublicSubnet
@@ -94,34 +95,7 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NATGateway
 
-  JumpServer:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t2.micro
-      KeyName: oregon-test
-      ImageId: ami-00c257e12d6828491
-      NetworkInterfaces:
-        - AssociatePublicIpAddress: true
-          SubnetId: !Ref PublicSubnet
-          GroupSet:
-            - !Ref JumpServerSecurityGroup
-          DeviceIndex: 0
-      Tags:
-        - Key: Name
-          Value: JumpServer
-
-  JumpServerSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow SSH access
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
-
-  WebServer:
+  DockerInstance1:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t2.micro
@@ -135,29 +109,74 @@ Resources:
           DeviceIndex: 0
       Tags:
         - Key: Name
-          Value: WebServer
+          Value: DockerInstance1
       UserData:
         Fn::Base64: |
           #!/bin/bash
           apt update -y
-          apt install apache2 unzip -y
-          systemctl start apache2
-          cd /var/www/html/
-          wget https://www.tooplate.com/view/2129-crispy-kitchen
-          unzip 2129-crispy-kitchen.zip
-          mv index.html index.html.old
-          cp -R 2129-crispy-kitchen/* .
+          apt install -y docker.io unzip
+          systemctl start docker
+          systemctl enable docker
+          docker swarm init --advertise-addr $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+          docker pull httpd:latest
+          mkdir -p /var/www/html
+          cd /var/www/html
+          wget http://www.tooplate.com/zip-templates/2132_clean_work.zip
+          unzip 2132_clean_work.zip
+          mv 2132_clean_work/* .
+          docker service create --name apache --replicas 2 -p 80:80 --mount type=bind,source=/var/www/html,target=/usr/local/apache2/htdocs httpd:latest
+
+  DockerInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: oregon-test
+      ImageId: ami-00c257e12d6828491
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          SubnetId: !Ref PrivateSubnet
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+          DeviceIndex: 0
+      Tags:
+        - Key: Name
+          Value: DockerInstance2
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          apt update -y
+          apt install -y docker.io unzip
+          systemctl start docker
+          systemctl enable docker
+          MANAGER_IP=$(aws ec2 describe-instances --region us-west-2 --filters "Name=tag:Name,Values=DockerInstance1" --query "Reservations[].Instances[].PrivateIpAddress" --output text)
+          docker swarm join --token $(docker swarm join-token -q worker) $MANAGER_IP:2377
 
   WebServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP access from ALB
+      GroupDescription: Allow HTTP and Docker Swarm traffic
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2377
+          ToPort: 2377
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 7946
+          ToPort: 7946
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: udp
+          FromPort: 7946
+          ToPort: 7946
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: udp
+          FromPort: 4789
+          ToPort: 4789
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
 
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -175,14 +194,10 @@ Resources:
     Properties:
       Name: ALB
       Scheme: internet-facing
-      LoadBalancerAttributes:
-        - Key: idle_timeout.timeout_seconds
-          Value: '60'
       SecurityGroups:
         - !Ref ALBSecurityGroup
       Subnets:
         - !Ref PublicSubnet
-        - !Ref PrivateSubnet
 
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -202,8 +217,12 @@ Resources:
       Protocol: HTTP
       VpcId: !Ref VPC
       TargetType: instance
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
       Targets:
-        - Id: !Ref WebServer
+        - Id: !Ref DockerInstance1
+        - Id: !Ref DockerInstance2
 
 Outputs:
   LoadBalancerDNS:
